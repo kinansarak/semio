@@ -93,6 +93,7 @@ import { Slot } from "@radix-ui/react-slot";
 import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { closestCenter, DndContext, DragEndEvent, PointerSensor, useDraggable, useDroppable, useSensor, useSensors } from "@dnd-kit/core";
 import { createPortal } from "react-dom";
+import { renderToStaticMarkup } from "react-dom/server";
 import { cva, type VariantProps } from "class-variance-authority";
 import { forceCenter, forceCollide, forceLink, forceManyBody, forceSimulation, forceX, forceY, Simulation, SimulationLinkDatum, SimulationNodeDatum } from "d3-force";
 import { initReactI18next, useTranslation } from "react-i18next";
@@ -10731,8 +10732,7 @@ function Label({ id, labelElementId, className, children }: LabelProps) {
           {isTree ? (
             <div data-slot="property-label-tree" className="relative min-w-0" style={{ paddingLeft: treeLabelCellPaddingLeft }}>
               <IndentationLines level={level} isLastAtLevel={isLastAtLevel} showLines={showLines} />
-              <div className="inline-flex items-center gap-[6px] min-w-0 h-[22px]">
-                <div className="w-[14px] flex-shrink-0" />
+              <div className="inline-flex min-w-0 h-[22px]">
                 <span data-slot="property-label" id={labelElementId} className="inline-flex items-center text-xs font-medium flex-shrink-0 text-left truncate cursor-pointer transition-colors hover:bg-hover-panel h-[22px]">
                   {label}
                 </span>
@@ -20344,6 +20344,51 @@ if (treeVitest) {
       ];
 
       expect(getTreeItemOrderedIds(sections, {}, {})).toEqual(["item-a", "item-a-1", "item-b", "item-c"]);
+    });
+
+    it("does not render an extra placeholder gap for tree property labels", () => {
+      const markup = renderToStaticMarkup(
+        <TreeContext.Provider value={{ level: 1, isLastAtLevel: [true], showLines: true, isTree: true }}>
+          <Label id="tooltip.manual">
+            <span>Control</span>
+          </Label>
+        </TreeContext.Provider>,
+      );
+
+      expect(markup).toContain("data-slot=\"property-label-tree\"");
+      expect(markup).toContain("padding-left:30px");
+      expect(markup).not.toContain("gap-[6px]");
+      expect(markup).not.toContain("w-[14px] flex-shrink-0");
+    });
+  });
+
+  describe("layout helpers", () => {
+    it("converts abstract layout nodes to GoldenLayout config", () => {
+      expect(
+        layoutNodeToGoldenLayoutConfig({
+          root: {
+            kind: "row",
+            children: [
+              {
+                kind: "stack",
+                size: 100,
+                children: [{ kind: "window", windowKindId: "table", title: "table" }],
+              },
+            ],
+          },
+        }),
+      ).toEqual({
+        root: {
+          type: "row",
+          content: [
+            {
+              type: "stack",
+              size: "100%",
+              content: [{ type: "component", componentName: "table", title: "table", componentState: {} }],
+            },
+          ],
+        },
+      });
     });
   });
 }

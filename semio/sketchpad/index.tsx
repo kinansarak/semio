@@ -269,6 +269,7 @@ import {
   useSensor,
   useSensors,
   useStoreApi,
+  useThree,
   useTranslation,
   VerticalWindows,
   ViewportPortal,
@@ -2231,14 +2232,16 @@ export class DerivedNode<T> {
   private compute: () => T;
   private value: T | undefined;
   private valueJson?: string;
+  private isEqual?: (a: T, b: T) => boolean;
   private subscribers = new Set<() => void>();
   private unsubscribers: Disposable[] = [];
   private initialized = false;
   version: number = 0;
 
-  constructor(deps: BaseDependency[], compute: () => T) {
+  constructor(deps: BaseDependency[], compute: () => T, isEqual?: (a: T, b: T) => boolean) {
     this.deps = deps;
     this.compute = compute;
+    this.isEqual = isEqual;
   }
 
   private init() {
@@ -2261,12 +2264,19 @@ export class DerivedNode<T> {
 
   private recompute() {
     const next = this.compute();
-    const nextJson = JSON.stringify(next, DerivedNode.jsonReplacer);
-    if (nextJson !== this.valueJson) {
+    if (this.isEqual) {
+      if (this.value !== undefined && this.isEqual(this.value, next)) return;
       this.value = next;
-      this.valueJson = nextJson;
       this.version++;
       this.subscribers.forEach((cb) => cb());
+    } else {
+      const nextJson = JSON.stringify(next, DerivedNode.jsonReplacer);
+      if (nextJson !== this.valueJson) {
+        this.value = next;
+        this.valueJson = nextJson;
+        this.version++;
+        this.subscribers.forEach((cb) => cb());
+      }
     }
   }
 
@@ -2311,9 +2321,9 @@ export class DerivedNode<T> {
 export class DerivedStore {
   private nodes = new Map<string, DerivedNode<any>>();
 
-  getOrCreate<T>(key: string, deps: BaseDependency[], compute: () => T): DerivedNode<T> {
+  getOrCreate<T>(key: string, deps: BaseDependency[], compute: () => T, isEqual?: (a: T, b: T) => boolean): DerivedNode<T> {
     if (!this.nodes.has(key)) {
-      this.nodes.set(key, new DerivedNode<T>(deps, compute));
+      this.nodes.set(key, new DerivedNode<T>(deps, compute, isEqual));
     }
     return this.nodes.get(key)! as DerivedNode<T>;
   }
@@ -2873,8 +2883,7 @@ export function createClearHoverHandler<TAppKey extends string, TAppState extend
   registerEventHandler(eventType, {
     guard: (context: any) => {
       const app = context[config.appKey];
-      const hover = app?.hover;
-      return hover !== undefined && Object.keys(hover).some((k) => hover[k] !== undefined && (Array.isArray(hover[k]) ? hover[k].length > 0 : true));
+      return app?.hover !== undefined;
     },
     action: (context: any) => {
       const app = context[config.appKey] || config.createDefaultState();
@@ -24684,12 +24693,12 @@ export const LayoutCanvas: FC<{
           return normalized;
         };
 
-        const rawConfig = parseWindowLayout(layoutState) || (windowConfig.defaultLayout ? layoutNodeToGoldenLayoutConfig(windowConfig.defaultLayout) : undefined);
-        if (!rawConfig) {
+        const parsedLayout = parseWindowLayout(layoutState) ?? parseWindowLayout(windowConfig.defaultLayout);
+        if (!parsedLayout) {
           console.error("[LayoutCanvas] No layout config provided!");
           return;
         }
-        const config = normalizeLayoutConfig(rawConfig);
+        const config = normalizeLayoutConfig(layoutNodeToGoldenLayoutConfig(parsedLayout));
 
         const layout = new GoldenLayout(config, containerRef.current!);
         let isInitialized = false;
@@ -24769,8 +24778,8 @@ export const LayoutCanvas: FC<{
 
           try {
             if (isInitialized) {
-              const config = layout.toConfig();
-              onLayoutChange(config);
+              const nextLayout = parseWindowLayout(layout.toConfig());
+              onLayoutChange(nextLayout ?? layout.toConfig());
             }
           } catch (error: any) {
             if (error?.message?.includes("not yet initialised")) {
@@ -29547,6 +29556,30 @@ function useDesignAppField<T, TEvent extends { type: string }>(options: UseDesig
 }
 
 /**
+ * Returns a reactive field for the Design app selection state.
+ * MUST create a Field wrapping the current selection and setter.
+ * [👤semio📚js🗃️sketchpad💻design🔖imports🔖store🔖components🛠️usedesignappselectionfield](repo://p/u/semio/b/l/js/fd/org/sketchpad/f/Design.tsx/s/Imports/s/Store/s/Components/d/i/useDesignAppSelectionField)
+ **/
+export function useDesignAppSelectionField(): Field<DesignAppSelection> {
+  return useDesignAppField<DesignAppSelection, { type: "DESIGN.SET_SELECTION"; kitGuid: Guid; designGuid: Guid; selection: DesignAppSelection }>({
+    createGranularSelector: createDesignSelectionSelector,
+    fallback: {},
+    createCanEvent: (kitGuid, designGuid) => ({ type: "DESIGN.SET_SELECTION", kitGuid, designGuid, selection: {} }),
+    createSendEvent: (kitGuid, designGuid, selection) => ({ type: "DESIGN.SET_SELECTION", kitGuid, designGuid, selection }),
+    useWildcardFallback: true,
+  });
+}
+
+/**
+ * Returns a hook result for the Design app selection state.
+ * MUST provide the current selection, a setter, and a canSet flag.
+ * [👤semio📚js🗃️sketchpad💻design🔖imports🔖store🔖components🛠️usedesignappselection](repo://p/u/semio/b/l/js/fd/org/sketchpad/f/Design.tsx/s/Imports/s/Store/s/Components/d/i/useDesignAppSelection)
+ **/
+export function useDesignAppSelection(): HookResult<DesignAppSelection> {
+  return fieldToHookResult(useDesignAppSelectionField());
+}
+
+/**
  * Returns a reactive field for the Design app fullscreen window.
  *MUST create a Field wrapping the fullscreen value and setter.
  * [👤semio📚js🗃️sketchpad💻design🔖imports🔖store🔖components🛠️usedesignappfullscreenfield](repo://p/u/semio/b/l/js/fd/org/sketchpad/f/Design.tsx/s/Imports/s/Store/s/Components/d/i/useDesignAppFullscreenField)
@@ -29762,23 +29795,34 @@ export function useDesignAppHover(): HookResult<DesignAppHover | undefined> {
   const designScope = useDesignScope();
   const kitGuid = kitScope?.guid ?? "";
   const designGuid = designScope?.guid ?? "";
+  const store = useDesignStore(identitySelector) as DesignStore | null;
   const selector = useMemo(() => createDesignHoverSelector(kitGuid, designGuid), [kitGuid, designGuid]);
   const value = useSelector(actor, selector);
+  const valueRef = useRef(value);
+  valueRef.current = value;
   const canSetEvent = useMemo(() => ({ type: "DESIGN.SET_HOVER" as const, kitGuid, designGuid, hover: {} }), [kitGuid, designGuid]);
   const canSet = useSelector(actor, (snapshot) => snapshot.can(canSetEvent));
+  const pendingHoverRef = useRef<{ hover: DesignAppHover | undefined; scheduled: boolean }>({ hover: undefined, scheduled: false });
   const setter = useMemo(() => {
     if (!canSet) return undefined;
     return (hover: DesignAppHover | undefined) => {
-      if (areHoverStatesEqual(value, hover)) return;
-      setTimeout(() => {
-        if (hover && (hover.pieces?.length || hover.connections?.length)) {
-          actor.send({ type: "DESIGN.SET_HOVER", kitGuid, designGuid, hover });
-        } else {
-          actor.send({ type: "DESIGN.CLEAR_HOVER", kitGuid, designGuid });
-        }
-      }, 0);
+      if (areHoverStatesEqual(valueRef.current, hover)) return;
+      store?.change({ hover: hover ?? {} });
+      pendingHoverRef.current.hover = hover;
+      if (!pendingHoverRef.current.scheduled) {
+        pendingHoverRef.current.scheduled = true;
+        queueMicrotask(() => {
+          const pendingHover = pendingHoverRef.current.hover;
+          pendingHoverRef.current.scheduled = false;
+          if (pendingHover && (pendingHover.pieces?.length || pendingHover.connections?.length || pendingHover.connectors?.length || pendingHover.types?.length || pendingHover.designs?.length)) {
+            actor.send({ type: "DESIGN.SET_HOVER", kitGuid, designGuid, hover: pendingHover });
+          } else {
+            actor.send({ type: "DESIGN.CLEAR_HOVER", kitGuid, designGuid });
+          }
+        });
+      }
     };
-  }, [actor, kitGuid, designGuid, canSet, value]);
+  }, [actor, kitGuid, designGuid, canSet, store]);
   return conditionalHookResult(canSet, value, setter);
 }
 
@@ -30984,10 +31028,12 @@ export function useDesignAppIsPieceHovered(id?: DesignAppId, pieceId?: string): 
   const designScope = useDesignScope();
   const kitGuid = kitScope?.guid ?? id?.kit ?? "";
   const designGuid = designScope?.guid ?? id?.design ?? "";
-  const selector = useMemo(() => createDesignHoverSelector(kitGuid, designGuid), [kitGuid, designGuid]);
-  const hover = useSelector(actor, selector);
-  if (!pieceId) return false;
-  return hover?.pieces?.includes(pieceId) ?? false;
+  const key = `${kitGuid}/${designGuid}`;
+  const selector = useMemo(
+    () => (state: any) => state.context.designApps[key]?.hover?.pieces?.includes(pieceId) ?? false,
+    [key, pieceId],
+  );
+  return useSelector(actor, selector);
 }
 
 /**
@@ -31031,12 +31077,14 @@ function computeHoverData(store: DesignStore | null, state: DesignAppState): Hov
   hover.types?.forEach((typeId) => transitivelyHoveredTypes.add(typeId));
 
   if (store && (hover.types?.length || hover.designs?.length)) {
+    const hoverTypesSet = hover.types ? new Set(hover.types) : undefined;
+    const hoverDesignsSet = hover.designs ? new Set(hover.designs) : undefined;
     const design = store.design().snapshot();
     design?.pieces?.forEach((piece) => {
-      if (piece.type && hover.types?.includes(piece.type.guid)) {
+      if (piece.type && hoverTypesSet?.has(piece.type.guid)) {
         transitivelyHoveredPieces.add(piece.guid);
       }
-      if (piece.design && hover.designs?.includes(piece.design.guid)) {
+      if (piece.design && hoverDesignsSet?.has(piece.design.guid)) {
         transitivelyHoveredPieces.add(piece.guid);
       }
     });
@@ -31044,8 +31092,9 @@ function computeHoverData(store: DesignStore | null, state: DesignAppState): Hov
 
   if (store && hover.pieces?.length) {
     const design = store.design().snapshot();
+    const pieceMap = new Map(design?.pieces?.map((p) => [p.guid, p]) ?? []);
     hover.pieces.forEach((pieceId) => {
-      const piece = design?.pieces?.find((p) => p.guid === pieceId);
+      const piece = pieceMap.get(pieceId);
       if (piece?.type?.guid) {
         transitivelyHoveredTypes.add(piece.type.guid);
       }
@@ -31139,10 +31188,12 @@ export function useDesignAppIsPieceSelected(id?: DesignAppId, pieceId?: string):
   const designScope = useDesignScope();
   const kitGuid = kitScope?.guid ?? id?.kit ?? "";
   const designGuid = designScope?.guid ?? id?.design ?? "";
-  const selector = useMemo(() => createDesignSelectionSelector(kitGuid, designGuid), [kitGuid, designGuid]);
-  const selection = useSelector(actor, selector);
-  if (!pieceId) return false;
-  return selection?.pieces?.includes(pieceId) ?? false;
+  const key = `${kitGuid}/${designGuid}`;
+  const selector = useMemo(
+    () => (state: any) => state.context.designApps[key]?.selection?.pieces?.includes(pieceId) ?? false,
+    [key, pieceId],
+  );
+  return useSelector(actor, selector);
 }
 
 /**
@@ -31218,10 +31269,12 @@ export function useDesignAppIsConnectionHovered(id?: DesignAppId, connectionId?:
   const designScope = useDesignScope();
   const kitGuid = kitScope?.guid ?? id?.kit ?? "";
   const designGuid = designScope?.guid ?? id?.design ?? "";
-  const selector = useMemo(() => createDesignHoverSelector(kitGuid, designGuid), [kitGuid, designGuid]);
-  const hover = useSelector(actor, selector);
-  if (!connectionId) return false;
-  return hover?.connections?.includes(connectionId) ?? false;
+  const key = `${kitGuid}/${designGuid}`;
+  const selector = useMemo(
+    () => (state: any) => state.context.designApps[key]?.hover?.connections?.includes(connectionId) ?? false,
+    [key, connectionId],
+  );
+  return useSelector(actor, selector);
 }
 
 /**
@@ -31235,10 +31288,12 @@ export function useDesignAppIsConnectionSelected(id?: DesignAppId, connectionId?
   const designScope = useDesignScope();
   const kitGuid = kitScope?.guid ?? id?.kit ?? "";
   const designGuid = designScope?.guid ?? id?.design ?? "";
-  const selector = useMemo(() => createDesignSelectionSelector(kitGuid, designGuid), [kitGuid, designGuid]);
-  const selection = useSelector(actor, selector);
-  if (!connectionId) return false;
-  return selection?.connections?.includes(connectionId) ?? false;
+  const key = `${kitGuid}/${designGuid}`;
+  const selector = useMemo(
+    () => (state: any) => state.context.designApps[key]?.selection?.connections?.includes(connectionId) ?? false,
+    [key, connectionId],
+  );
+  return useSelector(actor, selector);
 }
 
 /**
@@ -31252,9 +31307,12 @@ export function useDesignAppIsPortHovered(id: DesignAppId | undefined, pieceId: 
   const designScope = useDesignScope();
   const kitGuid = kitScope?.guid ?? id?.kit ?? "";
   const designGuid = designScope?.guid ?? id?.design ?? "";
-  const selector = useMemo(() => createDesignHoverSelector(kitGuid, designGuid), [kitGuid, designGuid]);
-  const hover = useSelector(actor, selector);
-  return hover?.connectors?.some((p) => p.piece === pieceId && p.connector === connectorId) ?? false;
+  const key = `${kitGuid}/${designGuid}`;
+  const selector = useMemo(
+    () => (state: any) => state.context.designApps[key]?.hover?.connectors?.some((p: any) => p.piece === pieceId && p.connector === connectorId) ?? false,
+    [key, pieceId, connectorId],
+  );
+  return useSelector(actor, selector);
 }
 
 /**
@@ -31279,11 +31337,23 @@ export function useDesignAppSelectedConnector(id?: DesignAppId): SelectedConnect
   const designScope = useDesignScope();
   const kitGuid = kitScope?.guid ?? id?.kit ?? "";
   const designGuid = designScope?.guid ?? id?.design ?? "";
-  const selector = useMemo(() => createDesignSelectionSelector(kitGuid, designGuid), [kitGuid, designGuid]);
-  const selection = useSelector(actor, selector);
-  const connector = selection?.connectors?.[0];
-  if (!connector?.piece || !connector?.connector) return EMPTY_CONNECTOR;
-  return { piece: connector.piece, connector: connector.connector };
+  const key = `${kitGuid}/${designGuid}`;
+  const selector = useMemo(
+    () => (state: any) => {
+      const connector = state.context.designApps[key]?.selection?.connectors?.[0];
+      if (!connector?.piece || !connector?.connector) return EMPTY_CONNECTOR;
+      return { piece: connector.piece, connector: connector.connector } as SelectedConnector;
+    },
+    [key],
+  );
+  const result = useSelector(actor, selector);
+  const stableRef = useRef<SelectedConnector>(result);
+  if (result === undefined) {
+    stableRef.current = undefined;
+  } else if (!stableRef.current || stableRef.current.piece !== result.piece || stableRef.current.connector !== result.connector) {
+    stableRef.current = result;
+  }
+  return stableRef.current;
 }
 
 /**
@@ -31297,10 +31367,12 @@ export function useDesignAppIsPiecePortSelected(pieceId: string, connectorId?: s
   const designScope = useDesignScope();
   const kitGuid = kitScope?.guid ?? "";
   const designGuid = designScope?.guid ?? "";
-  const selector = useMemo(() => createDesignSelectionSelector(kitGuid, designGuid), [kitGuid, designGuid]);
-  const selection = useSelector(actor, selector);
-  if (!connectorId) return false;
-  return selection?.connectors?.some((c) => c.piece === pieceId && c.connector === connectorId) ?? false;
+  const key = `${kitGuid}/${designGuid}`;
+  const selector = useMemo(
+    () => (state: any) => state.context.designApps[key]?.selection?.connectors?.some((c: any) => c.piece === pieceId && c.connector === connectorId) ?? false,
+    [key, pieceId, connectorId],
+  );
+  return useSelector(actor, selector);
 }
 
 /**
@@ -37281,6 +37353,7 @@ interface DesignMeshEventProps {
 
 const GLTFMesh: FC<{ url: string; highlightColor: string | null } & DesignMeshEventProps> = ({ url, highlightColor, onClick, onDoubleClick, onPointerEnter, onPointerLeave }) => {
   const gltf = useGLTF(url);
+  const invalidate = useThree((s) => s.invalidate);
   const plasterColor = useMemo(() => new THREE.Color(getComputedColor("--plaster")), []);
   const plasterEdgeColor = useMemo(() => new THREE.Color(getComputedColor("--plaster-edge")), []);
   const highlightThreeColor = useMemo(() => (highlightColor ? new THREE.Color(highlightColor) : null), [highlightColor]);
@@ -37310,12 +37383,14 @@ const GLTFMesh: FC<{ url: string; highlightColor: string | null } & DesignMeshEv
   }, [gltf.scene, plasterColor, plasterEdgeColor]);
   useEffect(() => {
     applyHighlightToLoadedScene(clonedScene, highlightThreeColor, plasterColor, plasterEdgeColor);
-  }, [clonedScene, highlightThreeColor, plasterColor, plasterEdgeColor]);
+    invalidate();
+  }, [clonedScene, highlightThreeColor, plasterColor, plasterEdgeColor, invalidate]);
   return <primitive object={clonedScene} onClick={onClick} onDoubleClick={onDoubleClick} onPointerEnter={onPointerEnter} onPointerLeave={onPointerLeave} />;
 };
 
 const FBXMesh: FC<{ url: string; highlightColor: string | null } & DesignMeshEventProps> = ({ url, highlightColor, onClick, onDoubleClick, onPointerEnter, onPointerLeave }) => {
   const scene = useFBX(url);
+  const invalidate = useThree((s) => s.invalidate);
   const plasterColor = useMemo(() => new THREE.Color(getComputedColor("--plaster")), []);
   const plasterEdgeColor = useMemo(() => new THREE.Color(getComputedColor("--plaster-edge")), []);
   const highlightThreeColor = useMemo(() => (highlightColor ? new THREE.Color(highlightColor) : null), [highlightColor]);
@@ -37345,12 +37420,14 @@ const FBXMesh: FC<{ url: string; highlightColor: string | null } & DesignMeshEve
   }, [scene, plasterColor, plasterEdgeColor]);
   useEffect(() => {
     applyHighlightToLoadedScene(clonedScene, highlightThreeColor, plasterColor, plasterEdgeColor);
-  }, [clonedScene, highlightThreeColor, plasterColor, plasterEdgeColor]);
+    invalidate();
+  }, [clonedScene, highlightThreeColor, plasterColor, plasterEdgeColor, invalidate]);
   return <primitive object={clonedScene} onClick={onClick} onDoubleClick={onDoubleClick} onPointerEnter={onPointerEnter} onPointerLeave={onPointerLeave} />;
 };
 
 const OBJMesh: FC<{ url: string; highlightColor: string | null } & DesignMeshEventProps> = ({ url, highlightColor, onClick, onDoubleClick, onPointerEnter, onPointerLeave }) => {
   const obj = useLoader(OBJLoader, url);
+  const invalidate = useThree((s) => s.invalidate);
   const plasterColor = useMemo(() => new THREE.Color(getComputedColor("--plaster")), []);
   const plasterEdgeColor = useMemo(() => new THREE.Color(getComputedColor("--plaster-edge")), []);
   const highlightThreeColor = useMemo(() => (highlightColor ? new THREE.Color(highlightColor) : null), [highlightColor]);
@@ -37380,7 +37457,8 @@ const OBJMesh: FC<{ url: string; highlightColor: string | null } & DesignMeshEve
   }, [obj, plasterColor, plasterEdgeColor]);
   useEffect(() => {
     applyHighlightToLoadedScene(clonedScene, highlightThreeColor, plasterColor, plasterEdgeColor);
-  }, [clonedScene, highlightThreeColor, plasterColor, plasterEdgeColor]);
+    invalidate();
+  }, [clonedScene, highlightThreeColor, plasterColor, plasterEdgeColor, invalidate]);
   return <primitive object={clonedScene} onClick={onClick} onDoubleClick={onDoubleClick} onPointerEnter={onPointerEnter} onPointerLeave={onPointerLeave} />;
 };
 
@@ -37579,19 +37657,27 @@ const ModelPiece: FC<ModelPieceProps> = () => {
     [focusPiece, piece.guid],
   );
 
-  const handlePointerEnter = useCallback(() => {
-    if (currentHoveredPieceGuidRef.current !== piece.guid) {
-      currentHoveredPieceGuidRef.current = piece.guid;
-      if (hoverPiece) hoverPiece(piece.guid);
-    }
-  }, [piece.guid, hoverPiece, currentHoveredPieceGuidRef]);
+  const handlePointerEnter = useCallback(
+    (e?: ThreeEvent<PointerEvent>) => {
+      e?.stopPropagation();
+      if (currentHoveredPieceGuidRef.current !== piece.guid) {
+        currentHoveredPieceGuidRef.current = piece.guid;
+        if (hoverPiece) hoverPiece(piece.guid);
+      }
+    },
+    [piece.guid, hoverPiece, currentHoveredPieceGuidRef],
+  );
 
-  const handlePointerLeave = useCallback(() => {
-    if (currentHoveredPieceGuidRef.current === piece.guid) {
-      currentHoveredPieceGuidRef.current = null;
-      if (clearHover) clearHover();
-    }
-  }, [piece.guid, clearHover, currentHoveredPieceGuidRef]);
+  const handlePointerLeave = useCallback(
+    (e?: ThreeEvent<PointerEvent>) => {
+      e?.stopPropagation();
+      if (currentHoveredPieceGuidRef.current === piece.guid) {
+        currentHoveredPieceGuidRef.current = null;
+        if (clearHover) clearHover();
+      }
+    },
+    [piece.guid, clearHover, currentHoveredPieceGuidRef],
+  );
 
   const materialColor = useMemo(() => {
     const tempDiv = document.createElement("div");
@@ -39658,9 +39744,12 @@ export function useTypeAppIsPortHovered(connectorId: string): HookResult<boolean
   const typeScope = useTypeScope();
   const kitGuid = kitScope?.guid ?? "";
   const typeGuid = typeScope?.guid ?? "";
-  const selector = useMemo(() => createTypeHoverSelector(kitGuid, typeGuid), [kitGuid, typeGuid]);
-  const hover = useSelector(actor, selector);
-  const value = hover?.connector === connectorId;
+  const key = `${kitGuid}/${typeGuid}`;
+  const selector = useMemo(
+    () => (state: any) => state.context.typeApps[key]?.hover?.connector === connectorId,
+    [key, connectorId],
+  );
+  const value = useSelector(actor, selector);
   const canSetEvent = useMemo(() => ({ type: "TYPE.HOVER_CONNECTOR" as const, kitGuid, typeGuid, connectorGuid: connectorId }), [kitGuid, typeGuid, connectorId]);
   const canSet = useSelector(actor, (snapshot) => snapshot.can(canSetEvent));
   const setter = useMemo(() => {
@@ -51886,6 +51975,8 @@ if (typeof process !== "undefined" && process.release && process.release.name ==
 
       const infiniteLoopErrors = errors.filter((e) => e.includes("Maximum update depth exceeded"));
       expect(infiniteLoopErrors).toHaveLength(0);
+      const missingDesignSelectionHookErrors = errors.filter((error) => error.includes("useDesignAppSelection is not defined"));
+      expect(missingDesignSelectionHookErrors).toHaveLength(0);
 
       const navbar = page.locator('[id="semio.sketchpad.navbar"]');
       await expect(navbar).toBeVisible({ timeout: 30000 });
